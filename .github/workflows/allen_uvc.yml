@@ -46,7 +46,7 @@ jobs:
         working-directory: ${{ env.WORK_DIR }}
         run: |
           rm -rf common
-          git clone --depth=1 -b codelinaro https://git.codelinaro.org/clo/la/kernel/msm-5.15.git common
+          git clone --depth=1 -b codelinaro https://github.com/topnotchfreaks/kernel_msm-5.15.git common
 
       - name: "ðŸ“¥ Download Clang toolchain"
         working-directory: ${{ env.WORK_DIR }}
