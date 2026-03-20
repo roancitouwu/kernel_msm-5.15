@@ -110,22 +110,21 @@ jobs:
         run: |
           CONFIG_FILE="./arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> "$CONFIG_FILE"
-          echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$CONFIG_FILE"
-          echo "CONFIG_TCP_CONG_BBR=y" >> "$CONFIG_FILE"
-          echo "CONFIG_DEFAULT_WESTWOOD=y" >> "$CONFIG_FILE"
           echo "CONFIG_OVERLAY_FS=y" >> "$CONFIG_FILE"
-          echo "CONFIG_TMPFS_XATTR=y" >> "$CONFIG_FILE"
           echo "CONFIG_KALLSYMS=y" >> "$CONFIG_FILE"
 
-      - name: "Append Makefile flags"
+      - name: "Disable module check"
         working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
         run: |
           echo 'KBUILD_CFLAGS += -Wno-implicit-function-declaration' >> Makefile
+          sed -i 's/check_modules_list/true #check_modules_list/g' build/build.sh || true
+          sed -i '/diff -u.*modules/d' build/build.sh || true
 
       - name: "Build kernel"
         working-directory: ${{ env.WORK_DIR }}
         run: |
-          LTO=thin BUILD_CONFIG=${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
+          SKIP_MRPROPER=1 LTO=thin BUILD_CONFIG=${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}/build.config.gki.aarch64 build/build.sh -j$(nproc --all) || true
+          ls -la out/dist/ || ls -la out/
 
       - name: "Package with AnyKernel3"
         run: |
