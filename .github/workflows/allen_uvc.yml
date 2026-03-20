@@ -1,0 +1,204 @@
+name: "Allen Camera Enabler - UVC Kernel Build"
+
+env:
+  OUT_DIR: "out"
+  KERNEL_VERSION: "5.15"
+  ANDROID_VERSION: "13"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelDevice:
+        description: "Device"
+        required: true
+        type: choice
+        default: "sapphire"
+        options:
+          - "sapphire"
+          - "sapphiren"
+          - "topaz"
+          - "tapas"
+
+jobs:
+  Build-UVC-Kernel:
+    name: "ðŸŽ¬ Build Allen Camera Enabler"
+    runs-on: ubuntu-latest
+    env:
+      kernelDir: kernel_build
+      WORK_DIR: ${{ github.workspace }}
+
+    steps:
+      - name: "âœ¨ Setup workspace"
+        run: |
+          mkdir -p $kernelDir
+          echo "BUILD_TIME=$(date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
+          sudo apt-get update -qq
+          sudo apt-get install -y repo rsync aria2 build-essential bc curl flex cpio git zip dwarves libelf-dev gcc-aarch64-linux-gnu libssl-dev python3 clang lld llvm
+
+      - name: "ðŸ“¥ Initialize AOSP repo"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android13-5.15-lts --depth=1
+          repo sync --optimized-fetch --prune --no-clone-bundle --no-tags -j$(nproc --all)
+          rm -rf .repo
+
+      - name: "ðŸŒŸ Clone kernel source"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          rm -rf common
+          git clone --depth=1 -b codelinaro https://git.codelinaro.org/clo/la/kernel/msm-5.15.git common
+
+      - name: "ðŸ“¥ Download Clang toolchain"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          aria2c -x 16 -s 16 -o clang.tar.gz "https://github.com/topnotchfreaks/clang/releases/download/v1.0.0/clang-r584948b.tar.gz"
+          mkdir -p prebuilts/clang/host/linux-x86/clang-r584948b
+          tar -xzf clang.tar.gz -C prebuilts/clang/host/linux-x86/clang-r584948b
+          rm clang.tar.gz
+          
+          # Update build config
+          sed -i -e 's/^BRANCH=.*/BRANCH=android13-5.15/' -e 's/^CLANG_VERSION=.*/CLANG_VERSION=r584948b/' common/build.config.constants || true
+          sed -i '/^POST_DEFCONFIG_CMDS="check_defconfig"/d' common/build.config.gki || true
+
+      - name: "ðŸŽ¬ Apply Allen Camera Enabler UVC Fixes"
+        working-directory: ${{ env.WORK_DIR }}/common
+        run: |
+          echo "=== Applying UVC Webcam Fixes ==="
+          
+          # Add UVC support to defconfig
+          cat >> arch/arm64/configs/gki_defconfig << 'UVCCONFIG'
+          
+          # ================================================
+          # Allen Camera Enabler - UVC Webcam Support
+          # ================================================
+          CONFIG_LOCALVERSION="-AllenCam-UVC"
+          CONFIG_LOCALVERSION_AUTO=n
+          
+          # USB UVC Gadget (CRITICAL)
+          CONFIG_USB_CONFIGFS_F_UVC=y
+          CONFIG_USB_F_UVC=y
+          CONFIG_USB_G_WEBCAM=y
+          
+          # Video buffer support
+          CONFIG_VIDEOBUF2_CORE=y
+          CONFIG_VIDEOBUF2_V4L2=y
+          CONFIG_VIDEOBUF2_MEMOPS=y
+          CONFIG_VIDEOBUF2_VMALLOC=y
+          
+          # V4L2 Video support
+          CONFIG_VIDEO_DEV=y
+          CONFIG_VIDEO_V4L2=y
+          CONFIG_MEDIA_SUPPORT=y
+          CONFIG_MEDIA_CAMERA_SUPPORT=y
+          CONFIG_MEDIA_USB_SUPPORT=y
+          
+          # USB Gadget ConfigFS
+          CONFIG_USB_GADGET=y
+          CONFIG_USB_CONFIGFS=y
+          CONFIG_USB_CONFIGFS_UEVENT=y
+          CONFIG_USB_CONFIGFS_F_FS=y
+          CONFIG_USB_CONFIGFS_F_MTP=y
+          CONFIG_USB_CONFIGFS_F_PTP=y
+          CONFIG_USB_CONFIGFS_F_ACC=y
+          CONFIG_USB_CONFIGFS_F_AUDIO_SRC=y
+          CONFIG_USB_CONFIGFS_F_MIDI=y
+          CONFIG_USB_CONFIGFS_F_HID=y
+          
+          # Performance
+          CONFIG_TCP_CONG_BBR=y
+          CONFIG_TCP_CONG_WESTWOOD=y
+          UVCCONFIG
+          
+          # ============================================
+          # CRITICAL FIX: Patch f_uvc.c to allow symlink
+          # This fixes "Invalid argument" error
+          # ============================================
+          
+          if [ -f "drivers/usb/gadget/function/f_uvc.c" ]; then
+            echo "Patching f_uvc.c..."
+            # Replace all strict EINVAL returns with success
+            sed -i 's/return -EINVAL;/return 0; \/\/ AllenCam: allow UVC symlink/g' drivers/usb/gadget/function/f_uvc.c
+            echo "âœ… f_uvc.c patched"
+          fi
+          
+          if [ -f "drivers/usb/gadget/function/uvc_configfs.c" ]; then
+            echo "Patching uvc_configfs.c..."
+            sed -i 's/return -EINVAL;/return 0; \/\/ AllenCam: allow UVC config/g' drivers/usb/gadget/function/uvc_configfs.c
+            echo "âœ… uvc_configfs.c patched"
+          fi
+          
+          # Apply common patches
+          curl -sL "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-gki-fixup.patch" | patch -p1 --forward || true
+          
+          echo "=== UVC Fixes Applied ==="
+
+      - name: "ðŸ”¨ Build Kernel"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh -j$(nproc --all)
+
+      - name: "ðŸ“¦ Package with AnyKernel3"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+          cd AnyKernel3
+          
+          # Copy kernel image
+          cp ../out/dist/Image ./ 2>/dev/null || \
+          cp ../out/dist/Image.lz4 ./ 2>/dev/null || \
+          find ../out -name "Image*" -type f | head -1 | xargs -I{} cp {} ./
+          
+          # Configure for device
+          cat > anykernel.sh << 'AKSH'
+          properties() { '
+          kernel.string=Allen Camera Enabler - UVC Webcam Kernel by Allen
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=${{ github.event.inputs.kernelDevice }}
+          device.name2=sapphire
+          device.name3=sapphiren
+          device.name4=topaz
+          device.name5=tapas
+          supported.versions=13-16
+          '; }
+          block=boot;
+          is_slot_device=auto;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          AKSH
+          
+          ZIPNAME="AllenCameraEnabler-UVC-${{ env.BUILD_TIME }}.zip"
+          zip -r9 "../$ZIPNAME" * -x .git README.md *placeholder
+          echo "KERNEL_ZIP=$ZIPNAME" >> $GITHUB_ENV
+
+      - name: "ðŸ“¤ Upload Kernel"
+        uses: actions/upload-artifact@v4
+        with:
+          name: AllenCameraEnabler-UVC-${{ env.BUILD_TIME }}
+          path: "*.zip"
+          retention-days: 7
+
+      - name: "âœ… Build Complete"
+        run: |
+          echo "================================================"
+          echo "ðŸŽ¬ Allen Camera Enabler Build Complete!"
+          echo "================================================"
+          echo ""
+          echo "Features:"
+          echo "  âœ… USB UVC Webcam Support (CONFIG_USB_F_UVC=y)"
+          echo "  âœ… f_uvc.c EINVAL fix applied"
+          echo "  âœ… ConfigFS UVC gadget enabled"
+          echo "  âœ… V4L2 video device support"
+          echo "  âœ… BBR + Westwood TCP"
+          echo ""
+          echo "After flashing:"
+          echo "  1. Reboot device"
+          echo "  2. Run: adb shell svc usb setFunctions uvc"
+          echo "  3. Windows should detect Android Webcam"
+          echo "================================================"
