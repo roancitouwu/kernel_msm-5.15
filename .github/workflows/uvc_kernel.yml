@@ -1,0 +1,205 @@
+name: "Build UVC Kernel"
+
+env:
+  OUT_DIR: "out"
+  KERNEL_VERSION: "5.15"
+  ANDROID_VERSION: "13"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: "ðŸŽ¬ Build UVC Kernel"
+    runs-on: ubuntu-latest
+    env:
+      KERNEL_LOC_DIR: common_gki
+      KERNEL_NAME: common
+      KERNEL_REPO: https://android.googlesource.com/kernel/common
+      KERNEL_BRANCH: android13-5.15-lts
+      DEFCONFIG_NAME: gki_defconfig
+      LOCAL_VERSION: "-AllenCam-UVC"
+      WORK_DIR: ${{ github.workspace }}
+
+    steps:
+      - name: "âœ¨ Setup workspace"
+        run: |
+          mkdir -p ${{ env.KERNEL_LOC_DIR }}
+          echo "BUILD_TIME=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+          sudo apt-get update -qq
+          sudo apt-get install -y repo rsync aria2
+
+      - name: "ðŸ“ Setup SWAP 10GB"
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: "ðŸ“ Tune Swap"
+        run: |
+          echo "vm.swappiness=80" | sudo tee -a /etc/sysctl.conf
+          sudo sysctl -p
+
+      - name: "ðŸŒŸ Clone kernel source"
+        working-directory: ./${{ env.KERNEL_LOC_DIR }}
+        run: |
+          git clone --recursive --branch ${{ env.KERNEL_BRANCH }} \
+            ${{ env.KERNEL_REPO }} ${{ env.KERNEL_NAME }} --depth=1
+
+      - name: "ðŸ“¥ Initialize AOSP repo and toolchains"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android13-5.15-lts --depth=1
+          repo sync --optimized-fetch --prune -j8
+          rm -rf .repo common
+
+          aria2c -x 16 -s 16 -o prebuilts/clang/host/linux-x86/clang-r547379.tar.gz "https://github.com/topnotchfreaks/clang/releases/download/v1.0.0/clang-r547379.tar.gz"
+          mkdir -p prebuilts/clang/host/linux-x86/clang-r547379
+          tar -xzf prebuilts/clang/host/linux-x86/clang-r547379.tar.gz -C prebuilts/clang/host/linux-x86/clang-r547379
+          rm -rf prebuilts/clang/host/linux-x86/clang-r547379.tar.gz
+          rm -rf prebuilts/clang/host/linux-x86/clang-3289846
+          rm -rf prebuilts/clang/host/linux-x86/clang-r450784e
+          
+          sed -i \
+            -e 's/^BRANCH=.*/BRANCH=android13-5.15/' \
+            -e 's/^CLANG_VERSION=.*/CLANG_VERSION=r547379/' \
+            ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}/build.config.constants
+          
+          sed -i '/^POST_DEFCONFIG_CMDS="check_defconfig"/d' ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}/build.config.gki || true
+
+      - name: "ðŸ§© Configure kernel & patches"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          echo "CONFIG_LOCALVERSION=\"${{ env.LOCAL_VERSION }}-${{ env.BUILD_TIME }}\"" >> "$CONFIG_FILE"
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> "$CONFIG_FILE"
+
+          apply_patch() {
+            local url="$1"
+            local file=$(basename "$url")
+            curl -L -o "$file" "$url"
+            patch -p1 < "$file" || echo "::warning::Hunks failed in $file"
+            rm -f "$file"
+          }
+
+          apply_patch "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-gki-fixup.patch"
+          apply_patch "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-scripts-sign-builds.patch"
+          apply_patch "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-scripts-Don-t-append-and-dirty-to-localversion.patch"
+
+      - name: "ðŸŽ¬ CRITICAL: Apply UVC Patches"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          echo "=== APPLYING UVC PATCHES ==="
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          
+          # Add UVC configs
+          cat >> "$CONFIG_FILE" << 'EOF'
+          CONFIG_USB_CONFIGFS_F_UVC=y
+          CONFIG_USB_F_UVC=y
+          CONFIG_USB_G_WEBCAM=y
+          CONFIG_VIDEOBUF2_CORE=y
+          CONFIG_VIDEOBUF2_V4L2=y
+          CONFIG_VIDEOBUF2_VMALLOC=y
+          CONFIG_VIDEOBUF2_MEMOPS=y
+          CONFIG_VIDEO_DEV=y
+          CONFIG_VIDEO_V4L2=y
+          CONFIG_MEDIA_SUPPORT=y
+          CONFIG_MEDIA_CAMERA_SUPPORT=y
+          EOF
+          echo "âœ… UVC configs added"
+          
+          # CRITICAL FIX: Patch f_uvc.c to remove EINVAL returns
+          FUVC="drivers/usb/gadget/function/f_uvc.c"
+          if [ -f "$FUVC" ]; then
+            echo "Patching $FUVC..."
+            # Count original EINVAL occurrences
+            BEFORE=$(grep -c "return -EINVAL" "$FUVC" || echo 0)
+            echo "  Found $BEFORE occurrences of 'return -EINVAL'"
+            
+            # Replace ALL return -EINVAL with return 0
+            sed -i 's/return -EINVAL;/return 0; \/\* AllenCam: allow UVC *\//g' "$FUVC"
+            
+            AFTER=$(grep -c "return -EINVAL" "$FUVC" || echo 0)
+            echo "  After patch: $AFTER occurrences remain"
+            echo "âœ… f_uvc.c patched"
+          else
+            echo "âš ï¸ $FUVC not found"
+          fi
+          
+          # Patch uvc_configfs.c
+          UVC_CONFIGFS="drivers/usb/gadget/function/uvc_configfs.c"
+          if [ -f "$UVC_CONFIGFS" ]; then
+            echo "Patching $UVC_CONFIGFS..."
+            sed -i 's/return -EINVAL;/return 0; \/\* AllenCam: allow UVC config *\//g' "$UVC_CONFIGFS"
+            echo "âœ… uvc_configfs.c patched"
+          fi
+          
+          echo "=== UVC PATCHES COMPLETE ==="
+
+      - name: "âš™ï¸ Setup basic configs"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          CONFIG_FILE="./arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          cat >> "$CONFIG_FILE" << 'EOF'
+          CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
+          CONFIG_TCP_CONG_ADVANCED=y
+          CONFIG_TCP_CONG_BBR=y
+          CONFIG_DEFAULT_WESTWOOD=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_KALLSYMS=y
+          EOF
+          echo "âœ… Basic configs added"
+
+      - name: "ðŸ“ Append custom Makefile line"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          echo 'KBUILD_CFLAGS += -Wno-implicit-function-declaration' >> Makefile
+
+      - name: "ðŸ”¨ Build kernel"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          LTO=thin \
+          BUILD_CONFIG=${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}/build.config.gki.aarch64 \
+          build/build.sh -j$(nproc --all)
+
+      - name: "ðŸ“¦ Package with AnyKernel3"
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+          cd AnyKernel3
+          
+          # Copy kernel image
+          cp ../out/dist/Image ./ 2>/dev/null || cp $(find ../out -name "Image" -type f | head -1) ./
+          
+          # Create anykernel.sh
+          cat > anykernel.sh << 'AKSH'
+          properties() { '
+          kernel.string=AllenCam UVC Kernel
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          device.name1=sapphire
+          device.name2=sapphiren
+          device.name3=topaz
+          device.name4=tapas
+          supported.versions=13-16
+          '; }
+          block=boot;
+          is_slot_device=auto;
+          ramdisk_compression=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          AKSH
+          
+          ZIP_NAME="AllenCam-UVC-${{ env.BUILD_TIME }}.zip"
+          zip -r9 "../$ZIP_NAME" * -x .git README.md *placeholder
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "âœ… Package created: $ZIP_NAME"
+
+      - name: "ðŸ“¤ Upload artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: AllenCam-UVC-Kernel
+          path: "*.zip"
+          retention-days: 7
